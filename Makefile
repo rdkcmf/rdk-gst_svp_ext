@@ -22,7 +22,8 @@ EXTRA_LDFLAGS = -lglib-2.0 -Wl,-rpath=../../,-rpath=./ -L./
 SOURCES = \
 	gst_svp_meta.cpp \
 	gst_svp_performance.cpp \
-	gst_svp_logging.cpp
+	gst_svp_logging.cpp \
+	gst_svp_scopedlock.cpp
 
 include device/platform.inc
 
