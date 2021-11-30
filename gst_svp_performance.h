@@ -41,6 +41,23 @@ extern "C" {
     //#define ENABLE_OCDM_PROFILING 1
 #endif
 
+// class DebugFunction
+// {
+// public:
+//     DebugFunction(const char* strFN) : _strFN(strFN)
+//     {
+//         LOG(eError, "%s ENTER TID %X\n", _strFN, pthread_self());
+//     }
+//     ~DebugFunction() 
+//     {
+//         LOG(eError, "%s EXIT TID %X\n", _strFN, pthread_self());
+//     }
+// private:
+//     const char* _strFN;
+// };
+// #define DBG_FN()     DebugFunction dbg_fn(__FUNCTION__)
+#define PERF_FN()     GstPerf(__FUNCTION__)
+
 #ifdef GST_SVP_PERF
 // Sec API Opaque Buffers
 #define SecOpaqueBuffer_Malloc(a, b) GstPerf_SecOpaqueBuffer_Malloc(a, b)

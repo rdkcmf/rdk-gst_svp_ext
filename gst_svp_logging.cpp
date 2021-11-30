@@ -76,16 +76,17 @@ void DebugBinaryData(char* szName, uint8_t* pData, size_t nSize)
     LOG(eTrace, "%s", buffer);
 }
 
-static void __attribute__((constructor)) LogModuleInit();
-static void __attribute__((destructor)) LogModuleTerminate();
+void __attribute__((constructor)) LogModuleInit();
+void __attribute__((destructor)) LogModuleTerminate();
 
 // This function is assigned to execute as a library init
 //  using __attribute__((constructor))
-static void ModuleInit()
+static void LogModuleInit()
 {
     LOG(eWarning, "GST SVP Logging initialize extending logging set to %d\n", s_VerboseLog);
     const char *env_log_level = getenv("GSTSVPEXT_EXTENDED_LOGGING");
-    if(strncasecmp(env_log_level, "true", strlen("true")) == 0) {
+    if(env_log_level != NULL &&
+       strncasecmp(env_log_level, "true", strlen("true")) == 0) {
       s_VerboseLog = true;
       LOG(eWarning, "Enabling GSTSVPEXT extended logging %d", s_VerboseLog);
     }

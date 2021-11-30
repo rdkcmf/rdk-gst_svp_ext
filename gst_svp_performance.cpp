@@ -26,6 +26,8 @@
 #include <string>
 #include <map>
 
+#include <gst/gst.h>
+
 extern "C" {
 #include <sec_security_datatype.h>
 #include <sec_security.h>
@@ -34,19 +36,454 @@ extern "C" {
 #include "gst_svp_logging.h"
 #include "GstPerf.h"
 
-GstPerf::GstPerf(const char* szName) 
-: m_deltaTime(0)
+#define REPORTING_INITIAL_COUNT 5000
+#define REPORTING_INTERVAL_COUNT 20000
+#define TIMER_INTERVAL_SECONDS 10
+#define MAX_DELAY 60
+#define MAX_BUF_SIZE 2048
+#define INITIAL_MIN_VALUE 1000000000
+
+std::map<pid_t, PerfProcess*> s_ProcessMap;
+
+void __attribute__((constructor)) PerfModuleInit();
+void __attribute__((destructor)) PerfModuleTerminate();
+
+static guint s_timerID = 0;
+
+static gboolean TimerCallback (gpointer pData)
 {
-    m_strName = szName;
-    m_startTime = TimeStamp();
+    gboolean bTimerContinue = true;
+    static uint32_t nDelay = 0;
+    static uint32_t nCount = 0;
+    //std::map<pid_t, PerfProcess*>* pMap = (std::map<pid_t, PerfProcess*>*)pData;
+
+    // Validate that threads in process are still active
+    auto it = s_ProcessMap.find(getpid());
+    if(it != s_ProcessMap.end()) {
+        // Found a process in the list
+        if(nCount > nDelay) {
+            GstPerf_ReportProcess(getpid());
+            nCount = 0;
+            if(nDelay < MAX_DELAY) {
+                nDelay+=5;
+            }
+            LOG(eWarning, "Next performance log in %d seconds\n", nDelay * TIMER_INTERVAL_SECONDS);
+        }
+        nCount++;
+    }
+    else {
+        LOG(eTrace, "Could not find Process ID %X for reporting\n", (uint32_t)getpid());
+    }
+
+    // Print report for process.
+    return bTimerContinue;
 }
-GstPerf::~GstPerf()
+// This function is assigned to execute as a library init
+//  using __attribute__((constructor))
+static void PerfModuleInit()
 {
-    m_deltaTime = TimeStamp() - m_startTime;
-    GstPerf_ReportTime(m_strName, m_deltaTime);
+    LOG(eWarning, "GST performance process initialize %X\n", getpid());
+    if(s_timerID == 0) {
+        s_timerID = g_timeout_add_seconds(TIMER_INTERVAL_SECONDS, (GSourceFunc)TimerCallback, (gpointer)&s_ProcessMap);
+        LOG(eTrace, "Created new timer (%u) with the context %p\n", s_timerID, NULL);
+    }
+}
+  
+// This function is assigned to execute as library unload
+// using __attribute__((destructor))
+static void PerfModuleTerminate()
+{
+    pid_t pID = getpid();
+
+    LOG(eWarning, "GST performance process terminate %X\n", pID);
+    GstPerf_ReportProcess(pID);
+
+    // Find thread in process map
+    auto it = s_ProcessMap.find(pID);
+    if(it == s_ProcessMap.end()) {
+        LOG(eError, "Could not find Process ID %X for reporting\n", (uint32_t)pID);
+        return;
+    }
+    else {
+        delete it->second;
+        s_ProcessMap.erase(it);
+    }
+
+    // Stop the timer
+    g_source_remove(s_timerID);
+    s_timerID = 0;
+
 }
 
-uint64_t GstPerf::TimeStamp() 
+PerfTree::PerfTree()
+:m_idThread(0), m_rootNode(NULL), m_ActivityCount(0), m_CountAtLastReport(0)
+{
+    memset(m_ThreadName, 0, THREAD_NAMELEN);
+    return;
+}
+PerfTree::~PerfTree()
+{
+    delete m_rootNode;
+
+    return;
+}
+
+void PerfTree::AddNode(PerfNode * pNode)
+{
+    PerfNode* pTreeNode = NULL;
+    PerfNode* pTop      = NULL;
+
+    //Get last opended node
+    if(m_activeNode.size() > 0) {
+        pTop = m_activeNode.top();
+    }
+    else {
+        // New Tree
+        m_rootNode = new PerfNode();    // root node special constructor
+        m_activeNode.push(m_rootNode);
+        m_idThread = pthread_self();
+        pthread_getname_np(m_idThread, m_ThreadName, THREAD_NAMELEN);
+        pTop = m_activeNode.top();
+        LOG(eWarning, "Creating new Tree stack size = %d\n", m_activeNode.size());
+    }
+    pTreeNode = pTop->AddChild(pNode);
+    m_activeNode.push(pTreeNode);
+    m_ActivityCount++;
+
+    pNode->SetTree(this);
+
+    return;
+}
+
+void PerfTree::CloseActiveNode(PerfNode * pTreeNode)
+{
+    //Get last opended node
+    PerfNode* pTop = m_activeNode.top();
+    if(pTop != NULL) {
+        // There is an active node
+        if(pTreeNode != pTop) {
+            // Error
+            LOG(eError, "Not closeing the active node(%s != %s)\n", 
+                pTop->GetName().c_str(), pTreeNode->GetName().c_str());
+        }
+        else {
+            // LOG(eTrace, "Closeing the active node %s\n", 
+            //             pTop->GetName().c_str());
+            m_activeNode.pop();
+        }
+    }
+
+    return;
+}
+
+void PerfTree::ReportData()
+{
+    // Get the root node and walk down the tree
+    LOG(eWarning, "Printing report on %X thread named %s\n", (uint32_t)m_idThread, m_ThreadName);
+    m_rootNode->ReportData(0);
+    
+    // Update the activity monitor
+    m_CountAtLastReport = m_ActivityCount;
+
+    return;
+}
+
+PerfProcess::PerfProcess(pid_t pID)
+: m_idProcess(pID)
+{
+    memset(m_ProcessName, 0, PROCESS_NAMELEN);
+    GetProcessName();
+    LOG(eWarning, "Creating new process with named <%.*s>\n",
+                  sizeof(m_ProcessName) <= PROCESS_NAMELEN ? (int)sizeof(m_ProcessName) : (int)PROCESS_NAMELEN, 
+                  m_ProcessName);
+    return;
+}
+PerfProcess::~PerfProcess()
+{
+    auto it = m_mapThreads.begin();
+    while(it != m_mapThreads.end()) {
+        delete it->second;
+        it++;
+    }
+    return;
+}
+bool PerfProcess::CloseInactiveThreads()
+{
+    bool retVal = false;
+
+    auto it = m_mapThreads.begin();
+    while(it != m_mapThreads.end()) {
+        PerfTree* pTree = it->second;
+        if(pTree->IsInactive()) {
+            LOG(eWarning, "Thread %s is inactive, removing from process %.*s\n", 
+                           pTree->GetName(),
+                           sizeof(m_ProcessName) <= PROCESS_NAMELEN ? (int)sizeof(m_ProcessName) : (int)PROCESS_NAMELEN, 
+                           m_ProcessName);
+            // Remove inactive thread from tree
+            delete it->second;
+            it = m_mapThreads.erase(it);
+            retVal = true;
+        }
+        else {
+            it++;
+        }
+    }
+    return retVal;
+}
+
+bool PerfProcess::RemoveTree(pthread_t tID)
+{
+    bool retVal = false;
+    PerfTree* pTree = GetTree(tID);
+    if(pTree != NULL) {
+        // Remove tree from process list.
+        auto it = m_mapThreads.find(tID);
+        if(it != m_mapThreads.end()) {
+            // Remove from list
+            delete it->second;
+            m_mapThreads.erase(it);
+            retVal = true;
+        }    
+    }
+
+    return retVal;
+}
+void PerfProcess::GetProcessName()
+{
+    char cmd[80] = { 0 };
+    sprintf(cmd, "/proc/%d/cmdline", m_idProcess);
+    FILE* fp = fopen(cmd,"r");
+    if(fp != NULL) {
+        size_t size = fread(m_ProcessName, sizeof(char), PROCESS_NAMELEN - 1, fp);
+        if(size <= 0) {
+            LOG(eError, "Could not read process name\n");
+        }
+        fclose(fp);
+    }
+    return;
+}
+PerfTree* PerfProcess::GetTree(pthread_t tID)
+{
+    PerfTree* pTree = NULL;
+
+    auto it = m_mapThreads.find(tID);
+    if(it == m_mapThreads.end()) {
+        // Cound not find thread in list
+        pTree = new PerfTree();
+        m_mapThreads[tID] = pTree;
+    }
+    else {
+        pTree = it->second;
+    }
+
+    return pTree;
+}
+
+void PerfProcess::ReportData()
+{
+    // Print reports for all the trees in this process.
+    LOG(eWarning, "Found %d threads in this process %X named <%.*s>\n", 
+                  m_mapThreads.size(), (uint32_t)m_idProcess, 
+                  sizeof(m_ProcessName) <= PROCESS_NAMELEN ? (int)sizeof(m_ProcessName) : (int)PROCESS_NAMELEN, 
+                  m_ProcessName);
+    auto it = m_mapThreads.begin();
+    while(it != m_mapThreads.end()) {
+        it->second->ReportData();
+        it++;
+    }    
+    
+    return;
+}
+
+PerfNode::PerfNode()
+: m_elementName("root_node"), m_nodeInTree(NULL), m_Tree(NULL), m_TheshholdInUS(-1)
+{
+    m_startTime     = TimeStamp();
+    m_idThread      = pthread_self();
+
+    memset(&m_stats, 0, sizeof(TimingStats));
+    m_stats.nTotalMin     = INITIAL_MIN_VALUE;      // Preset Min values to pickup the inital value
+    m_stats.nIntervalMin  = INITIAL_MIN_VALUE;
+    m_stats.elementName   = m_elementName;
+
+    LOG(eWarning, "Creating node for element %s\n", m_elementName.c_str());
+
+    return;
+}
+
+PerfNode::PerfNode(PerfNode* pNode)
+: m_nodeInTree(NULL), m_Tree(NULL), m_TheshholdInUS(-1)
+{
+    m_idThread      = pNode->m_idThread;
+    m_elementName   = pNode->m_elementName;
+    m_startTime     = pNode->m_startTime;
+    m_childNodes    = pNode->m_childNodes;
+
+    memset(&m_stats, 0, sizeof(TimingStats));
+    m_stats.nTotalMin     = INITIAL_MIN_VALUE;      // Preset Min values to pickup the inital value
+    m_stats.nIntervalMin  = INITIAL_MIN_VALUE;
+    m_stats.elementName   = m_elementName;
+
+    return;
+}
+
+PerfNode::PerfNode(std::string elementName)
+: m_elementName(elementName), m_nodeInTree(NULL), m_Tree(NULL), m_TheshholdInUS(-1)
+{
+    pid_t           pID = getpid();
+    PerfProcess*    pProcess = NULL;
+
+    //LOG(eWarning, "Creating node for element %s\n", m_elementName.c_str());
+    // Find thread in process map
+    auto it = s_ProcessMap.find(pID);
+    if(it == s_ProcessMap.end()) {
+        // no existing PID in map
+        pProcess = new PerfProcess(pID);
+        s_ProcessMap[pID] = pProcess;
+
+        LOG(eWarning, "Creating new process element %X\n", pProcess);
+    }
+    else {
+        pProcess = it->second;
+    }
+
+    m_startTime = TimeStamp();
+    m_idThread = pthread_self();
+
+    // Found PID get element tree for current thread.
+    PerfTree* pTree = pProcess->GetTree(m_idThread);
+    if(pTree) {
+        pTree->AddNode(this);
+    }
+
+    return;
+}
+
+PerfNode::~PerfNode()
+{
+    if(m_nodeInTree != NULL) {
+        // This is a node in the code
+        uint64_t deltaTime = TimeStamp() - m_startTime;
+        m_nodeInTree->IncrementData(deltaTime);
+        m_Tree->CloseActiveNode(m_nodeInTree);
+        if(m_TheshholdInUS > 0 && deltaTime > (uint64_t)m_TheshholdInUS) {
+            LOG(eWarning, "%s Threshold %ld exceeded, elapsed time = %0.3lf ms Avg time = %0.3lf (interval %0.3lf) ms\n", 
+                          GetName().c_str(), 
+                          m_TheshholdInUS / 1000,
+                          ((double)deltaTime) / 1000.0,
+                          ((double)m_nodeInTree->m_stats.nTotalTime / (double)m_nodeInTree->m_stats.nTotalCount) / 1000.0,
+                          ((double)m_nodeInTree->m_stats.nIntervalTime / (double)m_nodeInTree->m_stats.nIntervalCount) / 1000.0);
+            m_nodeInTree->ReportData(0, true);
+        }
+    }
+    else {
+        // This is a node in the tree and should be cleaned up
+        auto it = m_childNodes.begin();
+        while(it != m_childNodes.end()) {
+            delete it->second;
+            it++;
+        }
+    }
+
+    return;
+}
+PerfNode* PerfNode::AddChild(PerfNode * pNode)
+{
+    // Does this node exist in the list of children
+    auto it = m_childNodes.find(pNode->GetName());
+    if(it == m_childNodes.end()) {
+        // new child
+        // Create copy of Node for storage in the tree
+        PerfNode* copyNode = new PerfNode(pNode);
+        m_childNodes[pNode->GetName()] = copyNode;
+        pNode->m_nodeInTree = copyNode;
+    }
+    else {
+        pNode->m_nodeInTree = it->second;
+    }
+
+    return pNode->m_nodeInTree;
+}
+
+void PerfNode::IncrementData(uint64_t deltaTime)
+{
+    // Increment totals
+    m_stats.nLastDelta = deltaTime;
+    m_stats.nTotalTime += deltaTime;
+    m_stats.nTotalCount++;
+    if(m_stats.nTotalMin > deltaTime) {
+        m_stats.nTotalMin = deltaTime;
+    }
+    if(m_stats.nTotalMax < deltaTime) {
+        m_stats.nTotalMax = deltaTime;
+    }
+    m_stats.nTotalAvg = (double)m_stats.nTotalTime / (double)m_stats.nTotalCount;
+
+    // Increment intervals
+    m_stats.nIntervalTime += deltaTime;
+    m_stats.nIntervalCount++;
+    if(m_stats.nIntervalMin > deltaTime) {
+        m_stats.nIntervalMin = deltaTime;
+    }
+    if(m_stats.nIntervalMax < deltaTime) {
+        m_stats.nIntervalMax = deltaTime;
+    }
+    m_stats.nIntervalAvg = (double)m_stats.nIntervalTime / (double)m_stats.nIntervalCount;
+
+    return;
+}
+
+void PerfNode::ResetInterval()
+{
+    m_stats.nIntervalTime     = 0;
+    m_stats.nIntervalAvg      = 0;
+    m_stats.nIntervalMax      = 0;
+    m_stats.nIntervalMin      = INITIAL_MIN_VALUE;      // Need a large number here to get new min value
+    m_stats.nIntervalCount    = 0;
+
+    return;
+}
+
+void PerfNode::ReportData(uint32_t nLevel, bool bShowOnlyDelta)
+{
+    char buffer[MAX_BUF_SIZE] = { 0 };
+    char* ptr = &buffer[0];
+    // Print the indent 
+    for(uint32_t nIdx = 0; nIdx < nLevel; nIdx++) {
+        snprintf(ptr, MAX_BUF_SIZE, "--");
+        ptr += 2;
+    }
+
+    if(bShowOnlyDelta) {
+        // Print only the current delta time data 
+        snprintf(ptr, MAX_BUF_SIZE - strlen(buffer), "| %s elapsed time %0.3lf\n",
+                m_stats.elementName.c_str(),
+                (double)m_stats.nLastDelta / 1000.0);
+    }
+    else {
+        // Print data for this node
+        snprintf(ptr, MAX_BUF_SIZE - strlen(buffer), "| %s (Count, Max, Min, Avg) Total %lld, %0.3lf, %0.3lf, %0.3lf Interval %lld, %0.3lf, %0.3lf, %0.3lf\n",
+                m_stats.elementName.c_str(),
+                m_stats.nTotalCount, ((double)m_stats.nTotalMax) / 1000.0, ((double)m_stats.nTotalMin) / 1000.0, m_stats.nTotalAvg / 1000.0,
+                m_stats.nIntervalCount, ((double)m_stats.nIntervalMax) / 1000.0, ((double)m_stats.nIntervalMin) / 1000.0, m_stats.nIntervalAvg / 1000.0);
+    }
+    LOG(eWarning, "%s\n", buffer);
+    
+    // Print data for all the children
+    auto it = m_childNodes.begin();
+    while(it != m_childNodes.end()) {
+        it->second->ReportData(nLevel + 1, bShowOnlyDelta);
+        it++;
+    }
+
+    if(!bShowOnlyDelta) {
+        ResetInterval();
+    }
+
+    return;
+}
+
+uint64_t PerfNode::TimeStamp() 
 {
     struct timeval  timeStamp;
     uint64_t        retVal = 0;
@@ -59,94 +496,95 @@ uint64_t GstPerf::TimeStamp()
     return retVal;
 }
 
-typedef struct _TimingStats
+GstPerf::GstPerf(const char* szName) 
+: m_node(szName)
 {
-    std::string strName;
-    uint64_t nTotalTime;
-    double   nTotalAvg;
-    uint64_t nTotalMax;
-    uint64_t nTotalMin;
-    uint64_t nTotalCount;
-    uint64_t nIntervalTime;
-    double   nIntervalAvg;
-    uint64_t nIntervalMax;
-    uint64_t nIntervalMin;
-    uint64_t nIntervalCount;
-} TimingStats;
-
-static std::map<std::string, TimingStats> s_timingMap;
-#define MAX_INTERVAL_COUNT 1000
-
-static void GstPerf_IncrementData(TimingStats& stats, uint64_t deltaTime)
+    return;
+}
+GstPerf::GstPerf(const char* szName, uint32_t nThresholdInUS)
+: m_node(szName)
 {
-    // Increment totals
-    stats.nTotalTime += deltaTime;
-    stats.nTotalCount++;
-    if(stats.nTotalMin > deltaTime) {
-        stats.nTotalMin = deltaTime;
-    }
-    if(stats.nTotalMax < deltaTime) {
-        stats.nTotalMax = deltaTime;
-    }
-    stats.nTotalAvg = (double)stats.nTotalTime / (double)stats.nTotalCount;
-
-    // Increment intervals
-    stats.nIntervalTime += deltaTime;
-    stats.nIntervalCount++;
-    if(stats.nIntervalMin > deltaTime) {
-        stats.nIntervalMin = deltaTime;
-    }
-    if(stats.nIntervalMax < deltaTime) {
-        stats.nIntervalMax = deltaTime;
-    }
-    stats.nIntervalAvg = (double)stats.nIntervalTime / (double)stats.nIntervalCount;
-
+    m_node.SetThreshold(nThresholdInUS);
     return;
 }
 
-static void GstPerf_LogData(TimingStats& stats)
+void GstPerf::SetThreshhold(uint32_t nThresholdInUS)
 {
-    LOG(eWarning, "SVP Performance Timing (in ms): %s (Count, Max, Min, Avg) Total %lld, %0.3lf, %0.3lf, %0.3lf Interval %lld, %0.3lf, %0.3lf, %0.3lf\n",
-            stats.strName.c_str(),
-            stats.nTotalCount, ((double)stats.nTotalMax) / 1000.0, ((double)stats.nTotalMin) / 1000.0, stats.nTotalAvg / 1000.0,
-            stats.nIntervalCount, ((double)stats.nIntervalMax) / 1000.0, ((double)stats.nIntervalMin) / 1000.0, stats.nIntervalAvg / 1000.0);
+    m_node.SetThreshold(nThresholdInUS); 
 }
 
-static void GstPerf_ResetInterval(TimingStats& stats)
+GstPerf::~GstPerf()
 {
-    stats.nIntervalTime     = 0;
-    stats.nIntervalAvg      = 0;
-    stats.nIntervalMax      = 0;
-    stats.nIntervalMin      = 0;
-    stats.nIntervalCount    = 0;
-
     return;
 }
 
-void GstPerf_ReportTime(std::string strName, uint64_t deltaTime)
-{
-    std::map<std::string, TimingStats>::iterator it;
-    // Find and existing key
-    it = s_timingMap.find(strName);
-    if (it != s_timingMap.end()) {
-        // Found Key
-        GstPerf_IncrementData(it->second, deltaTime);
 
-        if(it->second.nIntervalCount >= MAX_INTERVAL_COUNT) {
-            GstPerf_LogData(it->second);
-            GstPerf_ResetInterval(it->second);
-        }
+void GstPerf_ReportProcess(pid_t pID)
+{
+    // Find Process ID in List
+    PerfProcess*    pProcess = NULL;
+
+    // Find thread in process map
+    auto it = s_ProcessMap.find(pID);
+    if(it == s_ProcessMap.end()) {
+        LOG(eError, "Could not find Process ID %X for reporting\n", (uint32_t)pID);
+        return;
     }
     else {
-        // New element
-        LOG(eWarning, "Creating new stats element for %s\n", strName.c_str());
-        TimingStats stats;
-        memset(&stats, 0, sizeof(TimingStats));
-        stats.nTotalMin     = 1000000;      // Preset Min values to pickup the inital value
-        stats.nIntervalMin  = 1000000;
-        stats.strName = strName;
-        GstPerf_IncrementData(stats, deltaTime);
-        s_timingMap[strName] = stats;
+        pProcess = it->second;
+    }
+
+    if(pProcess != NULL) {
+        // Close threads that have no activity since the last report
+        pProcess->CloseInactiveThreads();
+        LOG(eWarning, "Printing process report for Process ID %X\n", (uint32_t)pID);
+        pProcess->ReportData();
+    }
+
+    return;
+}
+void GstPerf_ReportThread(pthread_t tID)
+{
+    // Find Process ID in List
+    PerfProcess*    pProcess = NULL;
+
+    // Find thread in process map
+    auto it = s_ProcessMap.find(getpid());
+    if(it == s_ProcessMap.end()) {
+        LOG(eError, "Could not find Process ID %X for reporting\n", (uint32_t)getpid());
+        return;
+    }
+    else {
+        pProcess = it->second;
+    }
+
+    PerfTree* pTree = pProcess->GetTree(tID);
+    if(pTree != NULL) {
+        LOG(eWarning, "Printing tree report for Task ID %X\n", (uint32_t)tID);
+        pTree->ReportData();
+    }
+
+    return;
+
+}
+
+void GstPerf_CloseThread(pthread_t tID)
+{
+    // Find Process ID in List
+    PerfProcess*    pProcess = NULL;
+
+    // Find thread in process map
+    auto it = s_ProcessMap.find(getpid());
+    if(it == s_ProcessMap.end()) {
+        LOG(eError, "Could not find Process ID %X for reporting\n", (uint32_t)getpid());
+        return;
+    }
+    else {
+        pProcess = it->second;
+    }
+
+    if(pProcess != NULL) {
+        pProcess->RemoveTree(tID);
     }
 
     return;
