@@ -17,6 +17,9 @@
  * limitations under the License.
 */
 
+#include <pthread.h>
+#include <unistd.h> // for getipd()
+
 #include "gst_svp_logging.h"
 
 #include <unistd.h> // for getipd()
@@ -44,7 +47,7 @@ void GstSvpLogging(eLogLevel level, const char* function, int line, const char *
     }
 
     // printf for now.
-    fprintf(fpOut, "Process ID %d : %s(%d) : %s", getpid(), function, line, logMessage);
+    fprintf(fpOut, "Process ID %X : TID %X : %s(%d) : %s", getpid(), (uint32_t)pthread_self(), function, line, logMessage);
     // fprintf(fpOut, "%s(%d) : %s", function, line, logMessage);
     fflush(fpOut);
     return;

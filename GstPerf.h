@@ -97,6 +97,8 @@ class PerfTree
 
     bool IsInactive() { return m_ActivityCount == m_CountAtLastReport; };
     char * GetName() { return m_ThreadName; };
+    std::stack<PerfNode*> GetStack() { return m_activeNode; }
+    pthread_t GetThreadID() { return m_idThread; };
 
     private:
     pthread_t               m_idThread;
@@ -114,6 +116,9 @@ class PerfProcess
     ~PerfProcess();
 
     PerfTree* GetTree(pthread_t tID);
+    PerfTree* NewTree(pthread_t tID);
+    void ShowTrees();
+    void ShowTree(PerfTree* pTree);
     void ReportData();
     void GetProcessName();
     bool CloseInactiveThreads();

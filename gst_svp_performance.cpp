@@ -34,6 +34,7 @@ extern "C" {
 }
 
 #include "gst_svp_logging.h"
+#include "gst_svp_scopedlock.h"
 #include "GstPerf.h"
 
 #define REPORTING_INITIAL_COUNT 5000
@@ -45,8 +46,8 @@ extern "C" {
 
 std::map<pid_t, PerfProcess*> s_ProcessMap;
 
-void __attribute__((constructor)) PerfModuleInit();
-void __attribute__((destructor)) PerfModuleTerminate();
+static void __attribute__((constructor)) PerfModuleInit();
+static void __attribute__((destructor)) PerfModuleTerminate();
 
 static guint s_timerID = 0;
 
@@ -82,7 +83,20 @@ static gboolean TimerCallback (gpointer pData)
 //  using __attribute__((constructor))
 static void PerfModuleInit()
 {
-    LOG(eWarning, "GST performance process initialize %X\n", getpid());
+    char cmd[80] = { 0 };
+    char strProcessName[PROCESS_NAMELEN];
+
+    sprintf(cmd, "/proc/%d/cmdline", getpid());
+    FILE* fp = fopen(cmd,"r");
+    if(fp != NULL) {
+        size_t size = fread(strProcessName, sizeof(char), PROCESS_NAMELEN - 1, fp);
+        if(size <= 0) {
+            LOG(eError, "Could not read process name\n");
+        }
+        fclose(fp);
+    }
+
+    LOG(eWarning, "GST performance process initialize %X named %s\n", getpid(), strProcessName);
     if(s_timerID == 0) {
         s_timerID = g_timeout_add_seconds(TIMER_INTERVAL_SECONDS, (GSourceFunc)TimerCallback, (gpointer)&s_ProcessMap);
         LOG(eTrace, "Created new timer (%u) with the context %p\n", s_timerID, NULL);
@@ -144,7 +158,8 @@ void PerfTree::AddNode(PerfNode * pNode)
         m_idThread = pthread_self();
         pthread_getname_np(m_idThread, m_ThreadName, THREAD_NAMELEN);
         pTop = m_activeNode.top();
-        LOG(eWarning, "Creating new Tree stack size = %d\n", m_activeNode.size());
+        LOG(eWarning, "Creating new Tree stack size = %d for node %s, thread name %s\n", 
+            m_activeNode.size(), pNode->GetName().c_str(), m_ThreadName);
     }
     pTreeNode = pTop->AddChild(pNode);
     m_activeNode.push(pTreeNode);
@@ -234,20 +249,18 @@ bool PerfProcess::CloseInactiveThreads()
 bool PerfProcess::RemoveTree(pthread_t tID)
 {
     bool retVal = false;
-    PerfTree* pTree = GetTree(tID);
-    if(pTree != NULL) {
-        // Remove tree from process list.
-        auto it = m_mapThreads.find(tID);
-        if(it != m_mapThreads.end()) {
-            // Remove from list
-            delete it->second;
-            m_mapThreads.erase(it);
-            retVal = true;
-        }    
+    // Remove tree from process list.
+    auto it = m_mapThreads.find(tID);
+    if(it != m_mapThreads.end()) {
+        // Remove from list
+        delete it->second;
+        it = m_mapThreads.erase(it);
+        retVal = true;
     }
 
     return retVal;
 }
+
 void PerfProcess::GetProcessName()
 {
     char cmd[80] = { 0 };
@@ -262,7 +275,28 @@ void PerfProcess::GetProcessName()
     }
     return;
 }
+
 PerfTree* PerfProcess::GetTree(pthread_t tID)
+{
+    PerfTree* pTree = NULL;
+
+    auto it = m_mapThreads.find(tID);
+    if(it != m_mapThreads.end()) {
+        pTree = it->second;
+    }
+    else {
+        LOG(eWarning, "Could not find %X in thread map Possible matches are:\n", tID);
+        auto it2 = m_mapThreads.begin();
+        while(it2 != m_mapThreads.end()) {
+            LOG(eWarning, "\tKey %X, ID %X\n", it2->first, it2->second->GetThreadID());
+            it2++;
+        }
+    }
+
+    return pTree;
+}
+
+PerfTree* PerfProcess::NewTree(pthread_t tID)
 {
     PerfTree* pTree = NULL;
 
@@ -273,10 +307,37 @@ PerfTree* PerfProcess::GetTree(pthread_t tID)
         m_mapThreads[tID] = pTree;
     }
     else {
-        pTree = it->second;
+        LOG(eError, "Trying to add a thread %d to a map where it already exists name = %s\n", 
+                    tID, it->second->GetName());
     }
 
     return pTree;
+}
+
+void PerfProcess::ShowTrees()
+{
+    LOG(eWarning, "Displaying %d threads in thread map for process %s\n", m_mapThreads.size(), m_ProcessName);
+    auto it = m_mapThreads.begin();
+    while(it != m_mapThreads.end()) {
+        LOG(eWarning, "Tree = %p\n", it->second);
+        if(it->second != NULL) {
+            ShowTree(it->second);
+        }
+        it++;
+    }
+}
+
+void PerfProcess::ShowTree(PerfTree* pTree)
+{
+    // Describe Thread
+    LOG(eWarning, "Found Thread %X in tree named %s with stack size %d\n", 
+        pTree->GetThreadID(),
+        pTree->GetName(),
+        pTree->GetStack().size());
+    // Show Stack
+    LOG(eWarning, "Top Node = %p name %s\n", pTree->GetStack().top(), pTree->GetStack().top()->GetName().c_str());
+
+    return;
 }
 
 void PerfProcess::ReportData()
@@ -298,6 +359,9 @@ void PerfProcess::ReportData()
 PerfNode::PerfNode()
 : m_elementName("root_node"), m_nodeInTree(NULL), m_Tree(NULL), m_TheshholdInUS(-1)
 {
+#ifndef DISABLE_METRICS
+    SCOPED_LOCK();
+
     m_startTime     = TimeStamp();
     m_idThread      = pthread_self();
 
@@ -307,13 +371,16 @@ PerfNode::PerfNode()
     m_stats.elementName   = m_elementName;
 
     LOG(eWarning, "Creating node for element %s\n", m_elementName.c_str());
-
+#endif // !DISABLE_METRICS
     return;
 }
 
 PerfNode::PerfNode(PerfNode* pNode)
 : m_nodeInTree(NULL), m_Tree(NULL), m_TheshholdInUS(-1)
 {
+#ifndef DISABLE_METRICS
+    SCOPED_LOCK();
+
     m_idThread      = pNode->m_idThread;
     m_elementName   = pNode->m_elementName;
     m_startTime     = pNode->m_startTime;
@@ -323,15 +390,18 @@ PerfNode::PerfNode(PerfNode* pNode)
     m_stats.nTotalMin     = INITIAL_MIN_VALUE;      // Preset Min values to pickup the inital value
     m_stats.nIntervalMin  = INITIAL_MIN_VALUE;
     m_stats.elementName   = m_elementName;
-
+#endif // !DISABLE_METRICS
     return;
 }
 
 PerfNode::PerfNode(std::string elementName)
 : m_elementName(elementName), m_nodeInTree(NULL), m_Tree(NULL), m_TheshholdInUS(-1)
 {
+#ifndef DISABLE_METRICS
     pid_t           pID = getpid();
     PerfProcess*    pProcess = NULL;
+
+    SCOPED_LOCK();
 
     //LOG(eWarning, "Creating node for element %s\n", m_elementName.c_str());
     // Find thread in process map
@@ -352,15 +422,22 @@ PerfNode::PerfNode(std::string elementName)
 
     // Found PID get element tree for current thread.
     PerfTree* pTree = pProcess->GetTree(m_idThread);
+    if(pTree == NULL) {
+        pTree = pProcess->NewTree(m_idThread);
+    }
+    
     if(pTree) {
         pTree->AddNode(this);
     }
-
+#endif // !DISABLE_METRICS
     return;
 }
 
 PerfNode::~PerfNode()
 {
+#ifndef DISABLE_METRICS
+    SCOPED_LOCK();
+
     if(m_nodeInTree != NULL) {
         // This is a node in the code
         uint64_t deltaTime = TimeStamp() - m_startTime;
@@ -384,11 +461,14 @@ PerfNode::~PerfNode()
             it++;
         }
     }
-
+#endif // !DISABLE_METRICS
     return;
 }
 PerfNode* PerfNode::AddChild(PerfNode * pNode)
 {
+#ifndef DISABLE_METRICS
+    SCOPED_LOCK();
+
     // Does this node exist in the list of children
     auto it = m_childNodes.find(pNode->GetName());
     if(it == m_childNodes.end()) {
@@ -403,10 +483,17 @@ PerfNode* PerfNode::AddChild(PerfNode * pNode)
     }
 
     return pNode->m_nodeInTree;
+#else 
+    return NULL;
+#endif // !DISABLE_METRICS
+
 }
 
 void PerfNode::IncrementData(uint64_t deltaTime)
 {
+#ifndef DISABLE_METRICS
+   SCOPED_LOCK();
+
     // Increment totals
     m_stats.nLastDelta = deltaTime;
     m_stats.nTotalTime += deltaTime;
@@ -429,23 +516,29 @@ void PerfNode::IncrementData(uint64_t deltaTime)
         m_stats.nIntervalMax = deltaTime;
     }
     m_stats.nIntervalAvg = (double)m_stats.nIntervalTime / (double)m_stats.nIntervalCount;
-
+#endif // !DISABLE_METRICS
     return;
 }
 
 void PerfNode::ResetInterval()
 {
+#ifndef DISABLE_METRICS
+    SCOPED_LOCK();
+
     m_stats.nIntervalTime     = 0;
     m_stats.nIntervalAvg      = 0;
     m_stats.nIntervalMax      = 0;
     m_stats.nIntervalMin      = INITIAL_MIN_VALUE;      // Need a large number here to get new min value
     m_stats.nIntervalCount    = 0;
-
+#endif // !DISABLE_METRICS
     return;
 }
 
 void PerfNode::ReportData(uint32_t nLevel, bool bShowOnlyDelta)
 {
+#ifndef DISABLE_METRICS
+    SCOPED_LOCK();
+
     char buffer[MAX_BUF_SIZE] = { 0 };
     char* ptr = &buffer[0];
     // Print the indent 
@@ -479,10 +572,12 @@ void PerfNode::ReportData(uint32_t nLevel, bool bShowOnlyDelta)
     if(!bShowOnlyDelta) {
         ResetInterval();
     }
-
+#endif // !DISABLE_METRICS
     return;
 }
 
+// No SCOPED_LOCK on this method as it is
+// thread safe
 uint64_t PerfNode::TimeStamp() 
 {
     struct timeval  timeStamp;
@@ -521,8 +616,11 @@ GstPerf::~GstPerf()
 
 void GstPerf_ReportProcess(pid_t pID)
 {
+#ifndef DISABLE_METRICS
     // Find Process ID in List
     PerfProcess*    pProcess = NULL;
+
+    SCOPED_LOCK();
 
     // Find thread in process map
     auto it = s_ProcessMap.find(pID);
@@ -535,18 +633,22 @@ void GstPerf_ReportProcess(pid_t pID)
     }
 
     if(pProcess != NULL) {
+        pProcess->ShowTrees();
         // Close threads that have no activity since the last report
         pProcess->CloseInactiveThreads();
         LOG(eWarning, "Printing process report for Process ID %X\n", (uint32_t)pID);
         pProcess->ReportData();
     }
-
+#endif // !DISABLE_METRICS
     return;
 }
 void GstPerf_ReportThread(pthread_t tID)
 {
+#ifndef DISABLE_METRICS
     // Find Process ID in List
     PerfProcess*    pProcess = NULL;
+
+    SCOPED_LOCK();
 
     // Find thread in process map
     auto it = s_ProcessMap.find(getpid());
@@ -563,15 +665,18 @@ void GstPerf_ReportThread(pthread_t tID)
         LOG(eWarning, "Printing tree report for Task ID %X\n", (uint32_t)tID);
         pTree->ReportData();
     }
-
+#endif // !DISABLE_METRICS
     return;
 
 }
 
 void GstPerf_CloseThread(pthread_t tID)
 {
+#ifndef DISABLE_METRICS
     // Find Process ID in List
     PerfProcess*    pProcess = NULL;
+
+    SCOPED_LOCK();
 
     // Find thread in process map
     auto it = s_ProcessMap.find(getpid());
@@ -586,7 +691,7 @@ void GstPerf_CloseThread(pthread_t tID)
     if(pProcess != NULL) {
         pProcess->RemoveTree(tID);
     }
-
+#endif // !DISABLE_METRICS
     return;
 }
 
@@ -626,7 +731,7 @@ static bool link_function(void* pLibrary, void** ppFunc, const char* szFuncName)
 
 Sec_Result GstPerf_SecOpaqueBuffer_Malloc(SEC_SIZE bufLength, Sec_OpaqueBufferHandle **handle)
 {
-   GstPerf perf("SecOpaqueBuffer_Malloc");
+    GstPerf perf("SecOpaqueBuffer_Malloc");
     return SecOpaqueBuffer_Malloc(bufLength, handle);
 }
 
