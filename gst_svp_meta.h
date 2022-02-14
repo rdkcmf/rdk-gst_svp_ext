@@ -90,7 +90,7 @@ gboolean svp_buffer_from_token(void * pContext, void* svp_token, void* svp_handl
 guint32  svp_token_size(void);
 gboolean svp_buffer_alloc_token(void **token);
 gboolean svp_buffer_free_token(void *token);
-gboolean svp_pipeline_buffers_available(void * pContext, GstBuffer * buffer, media_type mediaType);
+gboolean svp_pipeline_buffers_available(void * pContext, media_type mediaType);
 
 G_END_DECLS
 #endif /* __GST_BUFFER_SVP_H__ */

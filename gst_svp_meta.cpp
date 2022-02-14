@@ -91,8 +91,9 @@ gboolean svp_buffer_free_token(void *token)
     return  svp_buffer_free_token_impl(token);
 }
 
-gboolean svp_pipeline_buffers_available(void * pContext, GstBuffer * buffer, media_type mediaType)
+gboolean svp_pipeline_buffers_available(void * pContext, media_type mediaType)
 {
     GstPerf perf(__FUNCTION__);
-    return  svp_pipeline_buffers_available_impl(pContext, buffer, mediaType);
+    return  svp_pipeline_buffers_available_impl(pContext, mediaType);
 }
+
