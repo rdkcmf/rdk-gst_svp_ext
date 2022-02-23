@@ -91,6 +91,7 @@ guint32  svp_token_size(void);
 gboolean svp_buffer_alloc_token(void **token);
 gboolean svp_buffer_free_token(void *token);
 gboolean svp_pipeline_buffers_available(void * pContext, media_type mediaType);
+gboolean gst_buffer_append_init_metadata(GstBuffer * buffer);
 
 G_END_DECLS
 #endif /* __GST_BUFFER_SVP_H__ */

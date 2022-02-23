@@ -97,3 +97,9 @@ gboolean svp_pipeline_buffers_available(void * pContext, media_type mediaType)
     return  svp_pipeline_buffers_available_impl(pContext, mediaType);
 }
 
+gboolean gst_buffer_append_init_metadata(GstBuffer * buffer)
+{
+    GstPerf perf(__FUNCTION__);
+    return  gst_buffer_append_init_metadata_impl(buffer);
+}
+
