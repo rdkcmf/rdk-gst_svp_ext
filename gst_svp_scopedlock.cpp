@@ -1,20 +1,25 @@
-/*
- * If not stated otherwise in this file or this component's LICENSE file the
- * following copyright and licenses apply:
- *
- * Copyright 2021 RDK Management
- *
- * Licensed under the Apache License, Version 2.0 (the License);
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+/* Copyright (C) 2021 RDK Management.  All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions
+* are met:
+* 1. Redistributions of source code must retain the above copyright
+*    notice, this list of conditions and the following disclaimer.
+* 2. Redistributions in binary form must reproduce the above copyright
+*    notice, this list of conditions and the following disclaimer in the
+*    documentation and/or other materials provided with the distribution.
+*
+* THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS ``AS IS''
+* AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+* IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+* PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT HOLDERS. OR
+* CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL,
+* EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+* PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+* PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY
+* OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+* OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
 
@@ -37,13 +42,44 @@ std::recursive_mutex _lock;
 #else // USE_LIBC_SCOPED_LOCK
 ScopedMutex::ScopedMutex(const char* strFN) 
 : _strFN(strFN)
+, _bMutexAcquired(false)
 {
     if(!_bMutexInit) {
         InitMutex(&_lock);
     }
     
     if(_bMutexInit) {
-        pthread_mutex_lock(&_lock);
+        if(pthread_mutex_lock(&_lock) == 0) {
+            _bMutexAcquired = true;
+        }
+    }
+    else {
+        LOG(eError, "Mutex was not initialized for %s\n", _strFN);
+    }
+}
+ScopedMutex::ScopedMutex(const char* strFN, uint32_t timeoutMS)
+: _strFN(strFN)
+, _bMutexAcquired(false)
+{
+    uint32_t nCount = 0;
+
+    if(!_bMutexInit) {
+        InitMutex(&_lock);
+    }
+    
+    if(_bMutexInit) {
+        while(nCount < timeoutMS) {
+            if(pthread_mutex_trylock(&_lock) != 0) {
+                // Mutex not acquired
+                usleep(1000); //1 ms
+                nCount++;
+            }
+            else {
+                // mutex acquired
+                _bMutexAcquired = true;
+                break;
+            }
+        }
     }
     else {
         LOG(eError, "Mutex was not initialized for %s\n", _strFN);
@@ -51,7 +87,10 @@ ScopedMutex::ScopedMutex(const char* strFN)
 }
 ScopedMutex::~ScopedMutex() 
 {
-    pthread_mutex_unlock(&_lock);
+    if(_bMutexAcquired) {
+        pthread_mutex_unlock(&_lock);
+        _bMutexAcquired = false;
+    }
 }
 void ScopedMutex::InitMutex(pthread_mutex_t* pLock)
 {
