@@ -620,7 +620,7 @@ void GstPerf_ReportProcess(pid_t pID)
     // Find Process ID in List
     PerfProcess*    pProcess = NULL;
 
-    SCOPED_LOCK();
+    SCOPED_TRY_LOCK(100, void());
 
     // Find thread in process map
     auto it = s_ProcessMap.find(pID);
@@ -648,7 +648,7 @@ void GstPerf_ReportThread(pthread_t tID)
     // Find Process ID in List
     PerfProcess*    pProcess = NULL;
 
-    SCOPED_LOCK();
+    SCOPED_TRY_LOCK(100, void());
 
     // Find thread in process map
     auto it = s_ProcessMap.find(getpid());
@@ -676,7 +676,7 @@ void GstPerf_CloseThread(pthread_t tID)
     // Find Process ID in List
     PerfProcess*    pProcess = NULL;
 
-    SCOPED_LOCK();
+    SCOPED_TRY_LOCK(100, void());
 
     // Find thread in process map
     auto it = s_ProcessMap.find(getpid());
